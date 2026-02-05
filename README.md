@@ -10,13 +10,10 @@ Aunque el programa se puede ejecutar directamente con los archivos `DDNSClient.p
 
 ### Opción 1: Ejecutar con Python
 
-1. Asegúrate de tener Python instalado.
+1. Asegúrate de tener Python instalado (también las librerías necesarias).
 2. Coloca `DDNSClient.py` y `profiles.json` en la misma carpeta.
-3. Ejecuta:
-
-```bash
-python DDNSClient.py
-```
+3. Ejecuta `DDNSClient.py`.
+   
 
 ### Opción 2: Crear un .exe con PyInstaller (recomendado)
 
@@ -28,4 +25,4 @@ Desde la carpeta del proyecto, ejecuta:
 pyinstaller DDNSClient.spec
 ```
 
-Esto generará un ejecutable en la carpeta `dist` que podrás usar sin necesidad de instalar Python ni dependencias adicionales.
+Esto generará un ejecutable en la carpeta `dist` que podrás usar sin necesidad de instalar Python ni dependencias adicionales en cualquier otro equipo destino.
