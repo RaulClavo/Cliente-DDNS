@@ -44,6 +44,23 @@ class DDNSWorker:
             raise Exception(f"HTTP {r.status_code}: {r.text}") from e
         return r.json().get("items", [])
 
+    def delete_dns_records(self, records):
+        if not records:
+            return
+
+        url = f"https://spaceship.dev/api/v1/dns/records/{self.profile['domain']}"
+        headers = {
+            "X-API-Key": self.profile["api_key"],
+            "X-API-Secret": self.profile["api_secret"],
+            "content-type": "application/json"
+        }
+        payload = {"items": records}
+        r = requests.delete(url, json=payload, headers=headers, timeout=15)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            raise Exception(f"HTTP {r.status_code}: {r.text}") from e
+
     def update_dns(self, ip):
         p = self.profile
         url = f"https://spaceship.dev/api/v1/dns/records/{p['domain']}"
@@ -79,15 +96,16 @@ class DDNSWorker:
 
                 records = self.get_dns_records()
                 profile_name_for_api = "@" if self.profile.get("name") in ("@", "") else self.profile.get("name")
-                record = next(
-                    (r for r in records if r["type"] == "A" and r.get("name", "") == profile_name_for_api),
-                    None
-                )
+                matching_records = [
+                    r for r in records
+                    if r["type"] == "A" and r.get("name", "") == profile_name_for_api
+                ]
 
-                if record is None:
+                if not matching_records:
                     self.update_dns(public_ip)
                     self.log_cb(self.dns_name(), "Registro creado")
-                elif record.get("value") != public_ip:
+                elif len(matching_records) > 1 or any(r.get("value") != public_ip for r in matching_records):
+                    self.delete_dns_records(matching_records)
                     self.update_dns(public_ip)
                     self.log_cb(self.dns_name(), f"IP actualizada → {public_ip}")
                 else:
