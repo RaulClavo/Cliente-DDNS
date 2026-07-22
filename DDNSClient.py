@@ -12,119 +12,162 @@ from tkinter import messagebox, ttk
 import requests
 
 
+APP_NAME = "DDNSClient"
+WINDOW_SIZE = "900x520"
+
+
+def script_directory():
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+def user_data_directory():
+    if os.name == "nt":
+        base_directory = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    else:
+        base_directory = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base_directory, APP_NAME)
+
+
+def persistent_profiles_file():
+    return os.path.join(user_data_directory(), "profiles.json")
+
+
+def bundled_profiles_file():
+    return os.path.join(script_directory(), "profiles.json")
+
+
+def profile_dns_name(profile):
+    name = profile.get("name", "")
+    if name in ("", "@"):
+        return profile.get("domain", "")
+    return f"{name}.{profile.get('domain', '')}"
+
+
+def profile_api_name(profile):
+    return "@" if profile.get("name") in ("", "@") else profile.get("name")
+
+
+def normalize_profile(profile):
+    normalized = dict(profile)
+    normalized["api_key"] = str(normalized.get("api_key", "")).strip()
+    normalized["api_secret"] = str(normalized.get("api_secret", "")).strip()
+    normalized["domain"] = str(normalized.get("domain", "")).strip()
+    name = str(normalized.get("name", "@")).strip()
+    normalized["name"] = name if name else "@"
+    normalized["ttl"] = int(normalized.get("ttl", 300))
+    normalized["interval"] = int(normalized.get("interval", 60))
+    normalized["enabled"] = bool(normalized.get("enabled", False))
+    normalized["last_ip"] = str(normalized.get("last_ip", "")).strip()
+    return normalized
+
+
+def validate_profile_input(profile):
+    if not profile["api_key"] or not profile["api_secret"] or not profile["domain"]:
+        return "API Key, API Secret y Dominio son obligatorios"
+    if profile["name"] != "@":
+        if "." in profile["name"]:
+            return "El Subdominio no debe contener puntos. Usa solo la etiqueta (ej: www) o @ para el raíz"
+        if not re.fullmatch(r"[A-Za-z0-9-]{1,63}", profile["name"]):
+            return "Subdominio inválido. Solo letras, números y guiones (1-63 caracteres)."
+    return None
+
+
+def build_dns_record(profile, ip):
+    return {
+        "type": "A",
+        "name": profile_api_name(profile),
+        "address": ip,
+        "ttl": profile["ttl"],
+    }
+
+
 class DDNSWorker:
-    def __init__(self, profile, log_cb, refresh_cb):
+    def __init__(self, profile, log_cb, refresh_cb, save_cb):
         self.profile = profile
         self.log_cb = log_cb
         self.refresh_cb = refresh_cb
+        self.save_cb = save_cb
         self.running = False
         self.last_public_ip = "-"
         self.last_action = "-"
 
     def dns_name(self):
-        name = self.profile.get("name", "")
-        if name == "@" or name == "":
-            return f"{self.profile['domain']}"
-        return f"{name}.{self.profile['domain']}"
+        return profile_dns_name(self.profile)
 
-    def get_public_ip(self):
-        return requests.get("https://api.ipify.org", timeout=10).text.strip()
+    def api_url(self):
+        return f"https://spaceship.dev/api/v1/dns/records/{self.profile['domain']}"
 
-    def get_dns_records(self):
-        url = f"https://spaceship.dev/api/v1/dns/records/{self.profile['domain']}"
-        headers = {
-            "X-API-Key": self.profile["api_key"],
-            "X-API-Secret": self.profile["api_secret"]
-        }
-        params = {"take": 100, "skip": 0}
-        r = requests.get(url, headers=headers, params=params, timeout=15)
-        try:
-            r.raise_for_status()
-        except requests.HTTPError as e:
-            raise Exception(f"HTTP {r.status_code}: {r.text}") from e
-        return r.json().get("items", [])
-
-    def delete_dns_records(self, records):
-        if not records:
-            return
-
-        url = f"https://spaceship.dev/api/v1/dns/records/{self.profile['domain']}"
-        headers = {
+    def headers(self):
+        return {
             "X-API-Key": self.profile["api_key"],
             "X-API-Secret": self.profile["api_secret"],
-            "content-type": "application/json"
+            "content-type": "application/json",
         }
-        payload = {"items": records}
-        r = requests.delete(url, json=payload, headers=headers, timeout=15)
-        try:
-            r.raise_for_status()
-        except requests.HTTPError as e:
-            raise Exception(f"HTTP {r.status_code}: {r.text}") from e
 
-    def update_dns(self, ip):
-        p = self.profile
-        url = f"https://spaceship.dev/api/v1/dns/records/{p['domain']}"
-        headers = {
-            "X-API-Key": p["api_key"],
-            "X-API-Secret": p["api_secret"],
-            "content-type": "application/json"
-        }
-        name_for_api = "@" if p.get("name") in ("@", "") else p.get("name")
+    def get_public_ip(self):
+        response = requests.get("https://api.ipify.org", timeout=10)
+        response.raise_for_status()
+        return response.text.strip()
+
+    def request_with_error(self, method, **kwargs):
+        response = requests.request(method, self.api_url(), headers=self.headers(), timeout=15, **kwargs)
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise Exception(f"HTTP {response.status_code}: {response.text}") from exc
+        return response
+
+    def delete_previous_record(self, previous_ip):
+        payload = {"items": [build_dns_record(self.profile, previous_ip)]}
+        self.request_with_error("DELETE", json=payload)
+
+    def create_current_record(self, current_ip):
         payload = {
             "force": True,
-            "items": [{
-                "type": "A",
-                "name": name_for_api,
-                "address": ip,
-                "ttl": p["ttl"]
-            }]
+            "items": [build_dns_record(self.profile, current_ip)],
         }
-        r = requests.put(url, json=payload, headers=headers, timeout=15)
-        try:
-            r.raise_for_status()
-        except requests.HTTPError as e:
-            raise Exception(f"HTTP {r.status_code}: {r.text}") from e
+        self.request_with_error("PUT", json=payload)
+
+    def sync_if_needed(self, public_ip):
+        previous_ip = self.profile.get("last_ip", "")
+        if public_ip == previous_ip:
+            return "DNS ya actualizado"
+        if previous_ip:
+            self.delete_previous_record(previous_ip)
+        self.create_current_record(public_ip)
+        self.profile["last_ip"] = public_ip
+        self.save_cb()
+        return f"IP actualizada → {public_ip}"
+
+    def wait_interval(self):
+        for _ in range(self.profile["interval"]):
+            if not self.running:
+                break
+            time.sleep(1)
 
     def loop(self):
-        self.running = True
         self.refresh_cb()
 
         while self.running:
             try:
                 public_ip = self.get_public_ip()
                 self.last_public_ip = public_ip
-
-                records = self.get_dns_records()
-                profile_name_for_api = "@" if self.profile.get("name") in ("@", "") else self.profile.get("name")
-                matching_records = [
-                    r for r in records
-                    if r["type"] == "A" and r.get("name", "") == profile_name_for_api
-                ]
-
-                if not matching_records:
-                    self.update_dns(public_ip)
-                    self.log_cb(self.dns_name(), "Registro creado")
-                elif len(matching_records) > 1 or any(r.get("value") != public_ip for r in matching_records):
-                    self.delete_dns_records(matching_records)
-                    self.update_dns(public_ip)
-                    self.log_cb(self.dns_name(), f"IP actualizada → {public_ip}")
-                else:
-                    self.log_cb(self.dns_name(), "DNS ya actualizado")
-
-            except Exception as e:
-                self.log_cb(self.dns_name(), f"Error: {e}")
+                result = self.sync_if_needed(public_ip)
+                self.log_cb(self.dns_name(), result)
+            except Exception as exc:
+                self.log_cb(self.dns_name(), f"Error: {exc}")
 
             self.refresh_cb()
-
-            for _ in range(self.profile["interval"]):
-                if not self.running:
-                    break
-                time.sleep(1)
+            self.wait_interval()
 
         self.refresh_cb()
 
     def start(self):
         if not self.running:
+            self.running = True
             threading.Thread(target=self.loop, daemon=True).start()
 
     def stop(self):
@@ -134,63 +177,70 @@ class DDNSWorker:
 class DDNSApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("DDNSClient")
-        self.geometry("900x520")
+        self.title(APP_NAME)
+        self.geometry(WINDOW_SIZE)
         self.resizable(False, False)
         self.profiles = []
         self.workers = {}
-        try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-        except NameError:
-            script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-        self.data_file = os.path.join(script_dir, "profiles.json")
+        self.store_lock = threading.Lock()
+        self.main_thread = threading.current_thread()
+        self.data_file = persistent_profiles_file()
+        self.fallback_data_file = bundled_profiles_file()
         self.load_profiles()
         self.build_ui()
         self.start_enabled_profiles()
-        try:
-            self.refresh_tree()
-        except Exception:
-            pass
+        self.refresh_tree()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def on_close(self):
-        for w in list(self.workers.values()):
+        for worker in list(self.workers.values()):
             try:
-                w.stop()
+                worker.stop()
             except Exception:
                 pass
         self.save_profiles()
         self.destroy()
 
+    def is_main_thread(self):
+        return threading.current_thread() is self.main_thread
+
     def profile_id(self, profile):
-        name = profile.get("name", "")
-        if name in ("@", ""):
-            return profile.get("domain", "")
-        return f"{name}.{profile.get('domain', '')}"
+        return profile_dns_name(profile)
 
     def load_profiles(self):
+        source_file = self.data_file if os.path.exists(self.data_file) else self.fallback_data_file
         try:
-            if os.path.exists(self.data_file):
-                with open(self.data_file, "r", encoding="utf-8") as f:
-                    self.profiles = json.load(f)
+            if os.path.exists(source_file):
+                with open(source_file, "r", encoding="utf-8") as file_handle:
+                    raw_profiles = json.load(file_handle)
             else:
-                self.profiles = []
+                raw_profiles = []
         except Exception:
-            self.profiles = []
-        for p in self.profiles:
-            if "enabled" not in p:
-                p["enabled"] = False
+            raw_profiles = []
+
+        self.profiles = []
+        for profile in raw_profiles:
+            try:
+                self.profiles.append(normalize_profile(profile))
+            except Exception:
+                continue
+
+        if not os.path.exists(self.data_file):
+            self.save_profiles()
 
     def save_profiles(self):
-        try:
-            with open(self.data_file, "w", encoding="utf-8") as f:
-                json.dump(self.profiles, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        with self.store_lock:
+            try:
+                os.makedirs(os.path.dirname(self.data_file), exist_ok=True)
+                with open(self.data_file, "w", encoding="utf-8") as file_handle:
+                    json.dump(self.profiles, file_handle, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
 
     def build_ui(self):
         ttk.Label(self, text="DDNS Profiles", font=("Segoe UI", 11, "bold")).pack(pady=5)
-        self.tree = ttk.Treeview(self,columns=("name", "state", "ip", "last"),show="headings",height=10)
+
+        self.tree = ttk.Treeview(self, columns=("name", "state", "ip", "last"), show="headings", height=10)
         self.tree.heading("name", text="Nombre DNS")
         self.tree.heading("state", text="Estado")
         self.tree.heading("ip", text="Última IP pública")
@@ -200,12 +250,14 @@ class DDNSApp(tk.Tk):
         self.tree.column("ip", width=150, anchor="center")
         self.tree.column("last", width=300, anchor="center")
         self.tree.pack(fill="x", padx=10)
-        btns = ttk.Frame(self)
-        btns.pack(pady=5)
-        ttk.Button(btns, text="➕ Añadir", command=self.add_profile).pack(side="left", padx=5)
-        ttk.Button(btns, text="➖ Eliminar", command=self.delete_profile).pack(side="left", padx=5)
-        ttk.Button(btns, text="▶ Activar", command=self.activate).pack(side="left", padx=5)
-        ttk.Button(btns, text="⏹ Desactivar", command=self.deactivate).pack(side="left", padx=5)
+
+        buttons = ttk.Frame(self)
+        buttons.pack(pady=5)
+        ttk.Button(buttons, text="➕ Añadir", command=self.add_profile).pack(side="left", padx=5)
+        ttk.Button(buttons, text="➖ Eliminar", command=self.delete_profile).pack(side="left", padx=5)
+        ttk.Button(buttons, text="▶ Activar", command=self.activate).pack(side="left", padx=5)
+        ttk.Button(buttons, text="⏹ Desactivar", command=self.deactivate).pack(side="left", padx=5)
+
         ttk.Label(self, text="Log").pack(pady=5)
         self.logbox = tk.Text(self, height=10, state="disabled")
         self.logbox.pack(fill="both", padx=10)
@@ -214,118 +266,142 @@ class DDNSApp(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Nuevo perfil DDNS")
         win.geometry("320x380")
+
         fields = {}
         for label in ["API Key", "API Secret", "Dominio", "Subdominio", "TTL", "Intervalo"]:
             ttk.Label(win, text=label).pack(pady=2)
-            e = ttk.Entry(win)
-            e.pack()
-            fields[label] = e
+            entry = ttk.Entry(win)
+            entry.pack()
+            fields[label] = entry
+
         fields["Subdominio"].insert(0, "@")
         fields["TTL"].insert(0, "300")
         fields["Intervalo"].insert(0, "60")
 
         def save():
-            profile = {
-                "api_key": fields["API Key"].get().strip(),
-                "api_secret": fields["API Secret"].get().strip(),
-                "domain": fields["Dominio"].get().strip(),
-                "name": fields["Subdominio"].get().strip(),
-                "ttl": fields["TTL"].get().strip(),
-                "interval": fields["Intervalo"].get().strip(),
-                "enabled": False
-            }
-            if not profile["api_key"] or not profile["api_secret"] or not profile["domain"]:
-                messagebox.showerror("Error", "API Key, API Secret y Dominio son obligatorios")
+            profile = normalize_profile({
+                "api_key": fields["API Key"].get(),
+                "api_secret": fields["API Secret"].get(),
+                "domain": fields["Dominio"].get(),
+                "name": fields["Subdominio"].get(),
+                "ttl": fields["TTL"].get(),
+                "interval": fields["Intervalo"].get(),
+                "enabled": False,
+                "last_ip": "",
+            })
+
+            validation_error = validate_profile_input(profile)
+            if validation_error:
+                messagebox.showerror("Error", validation_error)
                 return
-            try:
-                profile["ttl"] = int(profile["ttl"])
-                profile["interval"] = int(profile["interval"])
-            except Exception:
-                messagebox.showerror("Error", "TTL e Intervalo deben ser números enteros")
-                return
-            if profile["name"] == "":
-                profile["name"] = "@"
-            if profile["name"] != "@":
-                if "." in profile["name"]:
-                    messagebox.showerror("Error", "El Subdominio no debe contener puntos. Usa sólo la etiqueta (ej: www) o @ para el raíz")
-                    return
-                if not re.fullmatch(r"[A-Za-z0-9-]{1,63}", profile["name"]):
-                    messagebox.showerror("Error", "Subdominio inválido. Sólo letras, números y guiones (1-63 caracteres).")
-                    return
+
             self.profiles.append(profile)
             self.save_profiles()
             self.refresh_tree()
             win.destroy()
+
         ttk.Button(win, text="Guardar", command=save).pack(pady=10)
 
+    def get_selected_profile(self):
+        selection = self.tree.selection()
+        if not selection:
+            return None, None
+        dns = selection[0]
+        profile = next((item for item in self.profiles if self.profile_id(item) == dns), None)
+        return dns, profile
+
     def delete_profile(self):
-        sel = self.tree.selection()
-        if not sel:return
-        dns = sel[0]
-        if dns in self.workers:
-            self.workers[dns].stop()
-            del self.workers[dns]
-        self.profiles = [p for p in self.profiles if self.profile_id(p) != dns]
+        dns, profile = self.get_selected_profile()
+        if not dns or profile is None:
+            return
+
+        worker = self.workers.pop(dns, None)
+        if worker is not None:
+            worker.stop()
+
+        self.profiles = [item for item in self.profiles if self.profile_id(item) != dns]
         self.save_profiles()
         self.refresh_tree()
 
-    def start_enabled_profiles(self):
-        for p in self.profiles:
-            if not p.get("enabled"):
-                continue
-            dns = self.profile_id(p)
-            if dns in self.workers and self.workers[dns].running:
-                continue
-            worker = DDNSWorker(p, self.log, self.refresh_tree)
+    def worker_for_profile(self, profile):
+        dns = self.profile_id(profile)
+        worker = self.workers.get(dns)
+        if worker is None:
+            worker = DDNSWorker(profile, self.log, self.refresh_tree, self.save_profiles)
             self.workers[dns] = worker
-            worker.start()
+        return worker
+
+    def start_enabled_profiles(self):
+        for profile in self.profiles:
+            if not profile.get("enabled"):
+                continue
+            worker = self.worker_for_profile(profile)
+            if not worker.running:
+                worker.start()
 
     def activate(self):
-        sel = self.tree.selection()
-        if not sel:return
-        dns = sel[0]
-        if dns in self.workers and self.workers[dns].running:return
-        profile = next(p for p in self.profiles if self.profile_id(p) == dns)
-        worker = DDNSWorker(profile, self.log, self.refresh_tree)
-        self.workers[dns] = worker
-        worker.start()
+        dns, profile = self.get_selected_profile()
+        if dns is None or profile is None:
+            return
+
         profile["enabled"] = True
+        worker = self.worker_for_profile(profile)
+        if not worker.running:
+            worker.start()
         self.save_profiles()
         self.refresh_tree()
 
     def deactivate(self):
-        sel = self.tree.selection()
-        if not sel:return
-        dns = sel[0]
-        if dns in self.workers:
-            self.workers[dns].stop()
-        profile = next((p for p in self.profiles if self.profile_id(p) == dns), None)
-        if profile is not None:
-            profile["enabled"] = False
-            self.save_profiles()
+        dns, profile = self.get_selected_profile()
+        if dns is None or profile is None:
+            return
+
+        worker = self.workers.get(dns)
+        if worker is not None:
+            worker.stop()
+
+        profile["enabled"] = False
+        self.save_profiles()
         self.refresh_tree()
 
     def refresh_tree(self):
+        if not self.is_main_thread():
+            try:
+                self.after(0, self.refresh_tree)
+            except Exception:
+                pass
+            return
+
         self.tree.delete(*self.tree.get_children())
-        for p in self.profiles:
-            dns = self.profile_id(p)
+        for profile in self.profiles:
+            dns = self.profile_id(profile)
             worker = self.workers.get(dns)
             state = "Activo" if worker and worker.running else "Detenido"
-            ip = worker.last_public_ip if worker else "-"
-            last = worker.last_action if worker else "-"
-            self.tree.insert("", "end", iid=dns, values=(dns, state, ip, last))
+            ip = worker.last_public_ip if worker and worker.running else profile.get("last_ip", "-") or "-"
+            last_action = worker.last_action if worker else "-"
+            self.tree.insert("", "end", iid=dns, values=(dns, state, ip, last_action))
 
-    def log(self, dns, msg):
+    def append_log(self, dns, msg):
         self.logbox.config(state="normal")
         self.logbox.insert("end", f"[{dns}] {msg}\n")
         self.logbox.see("end")
         self.logbox.config(state="disabled")
-        timestamped = f"{datetime.now().strftime('%H:%M:%S')} {msg}"
-        if dns in self.workers:
+
+    def log(self, dns, msg):
+        if not self.is_main_thread():
             try:
-                self.workers[dns].last_action = timestamped
+                self.after(0, lambda: self.log(dns, msg))
             except Exception:
                 pass
+            return
+
+        timestamped = f"{datetime.now().strftime('%H:%M:%S')} {msg}"
+        self.append_log(dns, msg)
+
+        worker = self.workers.get(dns)
+        if worker is not None:
+            worker.last_action = timestamped
+
         if dns in self.tree.get_children():
             self.tree.set(dns, "last", timestamped)
 
