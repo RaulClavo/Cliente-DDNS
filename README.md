@@ -24,5 +24,9 @@ Desde la carpeta del proyecto, ejecuta:
 ```bash
 pyinstaller DDNSClient.spec
 ```
+o
+```bash
+python -m pyInstaller DDNSClient.spec
+```
 
 Esto generará un ejecutable en la carpeta `dist` que podrás usar sin necesidad de instalar Python ni dependencias adicionales en cualquier otro equipo destino.
